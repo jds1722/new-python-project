@@ -7,26 +7,18 @@ from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Dict
-from uuid import uuid4
 
 import numpy as np
 import tifffile
 
 
-DEFAULT_CHANNELS: Dict[int, str] = {
+DEFAULT_CHANNELS = {
     0: "BF",
     1: "Nuclei",
-    2: "Plane2",
-    5: "Bead5",
-    6: "Plane6",
+    2: "Red",
+    5: "GCGbead",
+    6: "INSbead"
 }
-
-EVENT_BATCH_LIMIT = 100
-POLL_INTERVAL_MS = 75
-BUSY_POLL_INTERVAL_MS = 10
-TABLE_ROW_LIMIT = 2_000
-TABLE_TRIM_CHUNK = 250
 
 
 @dataclass
@@ -52,9 +44,7 @@ def read_planes(path: Path) -> np.ndarray:
 
 
 def safe_suffix(text: str) -> str:
-    cleaned = "".join(
-        character for character in text.strip() if character not in '<>:"/\\|?*'
-    )
+    cleaned = "".join(character for character in text.strip() if character not in '<>:"/\\|?*')
     if not cleaned:
         raise ValueError("suffix는 비워둘 수 없습니다.")
     return cleaned
@@ -69,86 +59,33 @@ def extract_tiff(
     planes = read_planes(source)
     required = max(channel_suffixes)
     if planes.shape[0] <= required:
-        raise ValueError(
-            f"plane이 {planes.shape[0]}개뿐입니다. index {required}까지 필요합니다."
-        )
+        raise ValueError(f"plane이 {planes.shape[0]}개뿐입니다. index {required}까지 필요합니다.")
 
     output_folder.mkdir(parents=True, exist_ok=True)
-    destinations = [
-        output_folder / f"{source.stem}_{safe_suffix(suffix)}.tif"
-        for suffix in channel_suffixes.values()
-    ]
-    destination_keys = [str(path).casefold() for path in destinations]
-    if len(set(destination_keys)) != len(destination_keys):
-        raise ValueError("suffix가 Windows에서 동일한 출력 파일명을 만듭니다.")
-
+    destinations = [output_folder / f"{source.stem}_{safe_suffix(suffix)}.tif" for suffix in channel_suffixes.values()]
     existing = [path.name for path in destinations if path.exists()]
     if existing and not overwrite:
         raise FileExistsError(f"출력 파일이 이미 존재합니다: {', '.join(existing)}")
 
-    transaction_id = uuid4().hex
-    temporary_paths = [
-        destination.with_name(f".{destination.stem}.{transaction_id}.tmp.tif")
-        for destination in destinations
-    ]
-    backups: dict[Path, Path] = {}
-    committed: list[Path] = []
+    written: list[Path] = []
     try:
-        for (index, _suffix), temporary_path in zip(
-            channel_suffixes.items(), temporary_paths
-        ):
+        for (index, _suffix), destination in zip(channel_suffixes.items(), destinations):
             tifffile.imwrite(
-                temporary_path,
+                destination,
                 planes[index],
                 photometric="minisblack",
-                metadata={
-                    "axes": "YX",
-                    "source_file": source.name,
-                    "source_plane_index": index,
-                },
+                metadata={"axes": "YX", "source_file": source.name, "source_plane_index": index},
             )
-
-        # Check again immediately before committing to avoid replacing a file
-        # created by another process while the temporary TIFFs were written.
-        existing = [path.name for path in destinations if path.exists()]
-        if existing and not overwrite:
-            raise FileExistsError(f"출력 파일이 이미 존재합니다: {', '.join(existing)}")
-
-        if overwrite:
-            for destination in destinations:
-                if destination.exists():
-                    backup = destination.with_name(
-                        f".{destination.stem}.{transaction_id}.backup.tif"
-                    )
-                    destination.replace(backup)
-                    backups[destination] = backup
-
-        for temporary_path, destination in zip(temporary_paths, destinations):
-            temporary_path.replace(destination)
-            committed.append(destination)
+            written.append(destination)
     except Exception:
-        # Remove only new transaction files, then restore every prior output.
-        for path in (*temporary_paths, *committed):
+        # Only remove files created during this failed extraction.
+        for path in written:
             try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for destination, backup in backups.items():
-            try:
-                if backup.exists():
-                    backup.replace(destination)
+                path.unlink()
             except OSError:
                 pass
         raise
-    else:
-        for backup in backups.values():
-            try:
-                backup.unlink(missing_ok=True)
-            except OSError:
-                # The new outputs are already committed. A leftover hidden
-                # backup is safer than turning a successful run into failure.
-                pass
-    return ExtractionResult(source, destinations)
+    return ExtractionResult(source, written)
 
 
 class TiffExtractorUI:
@@ -161,13 +98,9 @@ class TiffExtractorUI:
         self.recursive = tk.BooleanVar(value=False)
         self.overwrite = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="입력 폴더와 출력 폴더를 선택하세요.")
-        self.suffix_vars = {
-            index: tk.StringVar(value=suffix)
-            for index, suffix in DEFAULT_CHANNELS.items()
-        }
-        self.events: queue.Queue[tuple] = queue.Queue()
+        self.suffix_vars = {index: tk.StringVar(value=suffix) for index, suffix in DEFAULT_CHANNELS.items()}
+        self.events: queue.Queue = queue.Queue()
         self.running = False
-        self.hidden_table_rows = 0
         self._build()
 
     def _build(self):
@@ -249,12 +182,8 @@ class TiffExtractorUI:
             messagebox.showerror("설정 오류", "유효한 입력 폴더와 출력 폴더를 지정하세요.")
             return
         try:
-            suffixes = {
-                index: safe_suffix(variable.get())
-                for index, variable in self.suffix_vars.items()
-            }
-            normalized_suffixes = {suffix.casefold() for suffix in suffixes.values()}
-            if len(normalized_suffixes) != len(suffixes):
+            suffixes = {index: safe_suffix(variable.get()) for index, variable in self.suffix_vars.items()}
+            if len(set(suffixes.values())) != len(suffixes):
                 raise ValueError("각 채널의 suffix는 서로 달라야 합니다.")
         except ValueError as error:
             messagebox.showerror("suffix 오류", str(error))
@@ -262,157 +191,64 @@ class TiffExtractorUI:
 
         source_folder = Path(input_text)
         output_folder = Path(output_text)
+        iterator = source_folder.rglob("*") if self.recursive.get() else source_folder.iterdir()
+        files = sorted(path for path in iterator if path.is_file() and path.suffix.lower() in {".tif", ".tiff"})
+        if not files:
+            messagebox.showinfo("TIFF 없음", "입력 폴더에서 TIFF 파일을 찾지 못했습니다.")
+            return
 
-        existing_rows = self.table.get_children()
-        if existing_rows:
-            self.table.delete(*existing_rows)
-        self.hidden_table_rows = 0
-        self.progress.configure(mode="indeterminate", maximum=100, value=0)
-        self.progress.start(12)
-        self.status.set("TIFF 파일 검색 중...")
+        self.table.delete(*self.table.get_children())
+        self.progress.configure(maximum=len(files), value=0)
         self.run_button.configure(state="disabled")
         self.running = True
-        settings = (
-            source_folder,
-            output_folder,
-            suffixes,
-            self.overwrite.get(),
-            self.recursive.get(),
-        )
+        settings = (files, output_folder, suffixes, self.overwrite.get())
         threading.Thread(target=self._worker, args=settings, daemon=True).start()
-        self.root.after(POLL_INTERVAL_MS, self._poll_responsive)
+        self.root.after(75, self._poll)
 
-    def _worker(
-        self, source_folder, output_folder, suffixes, overwrite, recursive
-    ):
-        try:
-            iterator = source_folder.rglob("*") if recursive else source_folder.iterdir()
-            files = sorted(
-                path
-                for path in iterator
-                if path.is_file() and path.suffix.lower() in {".tif", ".tiff"}
-            )
-            if not files:
-                self.events.put(("empty", source_folder))
-                return
-
-            output_folder.mkdir(parents=True, exist_ok=True)
-            self.events.put(("scan_done", len(files)))
-            report_rows = []
-            success_count = 0
-            for position, source in enumerate(files, 1):
-                try:
-                    result = extract_tiff(source, output_folder, suffixes, overwrite)
-                    success_count += 1
-                    report_rows.append((str(source), "success", len(result.outputs), ""))
-                    self.events.put(
-                        ("row", position, len(files), source, len(result.outputs), "완료")
-                    )
-                except Exception as error:
-                    report_rows.append((str(source), "error", 0, str(error)))
-                    self.events.put(("row", position, len(files), source, 0, str(error)))
-
-            with (output_folder / "extraction_report.csv").open(
-                "w", newline="", encoding="utf-8-sig"
-            ) as file:
-                writer = csv.writer(file)
-                writer.writerow(("source_file", "status", "output_count", "error"))
-                writer.writerows(report_rows)
-            self.events.put(("done", success_count, len(files), output_folder))
-        except Exception as error:
-            self.events.put(("fatal", str(error), output_folder))
-
-    def _poll_responsive(self):
-        """Process worker events in bounded batches without blocking Tk."""
-        pending_rows = []
-        scan_total = None
-        terminal_event = None
-        processed_events = 0
-
-        while processed_events < EVENT_BATCH_LIMIT:
+    def _worker(self, files, output_folder, suffixes, overwrite):
+        output_folder.mkdir(parents=True, exist_ok=True)
+        report_rows = []
+        success_count = 0
+        for position, source in enumerate(files, 1):
             try:
+                result = extract_tiff(source, output_folder, suffixes, overwrite)
+                success_count += 1
+                report_rows.append((str(source), "success", len(result.outputs), ""))
+                self.events.put(("row", position, len(files), source, len(result.outputs), "완료"))
+            except Exception as error:
+                report_rows.append((str(source), "error", 0, str(error)))
+                self.events.put(("row", position, len(files), source, 0, str(error)))
+
+        with (output_folder / "extraction_report.csv").open("w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.writer(file)
+            writer.writerow(("source_file", "status", "output_count", "error"))
+            writer.writerows(report_rows)
+        self.events.put(("done", success_count, len(files), output_folder))
+
+    def _poll(self):
+        try:
+            while True:
                 event = self.events.get_nowait()
-            except queue.Empty:
-                break
-            processed_events += 1
-            if event[0] == "row":
-                pending_rows.append(event)
-            elif event[0] == "scan_done":
-                _, scan_total = event
-            elif event[0] in {"done", "empty", "fatal"}:
-                terminal_event = event
-
-        if scan_total is not None:
-            self.progress.stop()
-            self.progress.configure(mode="determinate", maximum=scan_total, value=0)
-            self.status.set(f"TIFF {scan_total}개 발견, 추출 시작")
-
-        if pending_rows:
-            for _, _position, _total, source, count, result_status in pending_rows:
-                self.table.insert("", "end", values=(source.name, count, result_status))
-
-            _, position, total, _source, _count, _result_status = pending_rows[-1]
-            self.progress["value"] = position
-            self.status.set(f"처리 중 {position}/{total}")
-            self._trim_table_rows()
-            # Scroll once per batch, not once per source TIFF.
-            self.table.yview_moveto(1)
-
-        if terminal_event is not None and terminal_event[0] == "done":
-            _, success, total, output = terminal_event
-            self.progress.stop()
-            self.running = False
-            self.run_button.configure(state="normal")
-            display_note = (
-                f" (최근 {TABLE_ROW_LIMIT:,}건 표시)" if self.hidden_table_rows else ""
-            )
-            self.status.set(f"완료: {total}개 중 {success}개 성공{display_note}")
-            messagebox.showinfo(
-                "추출 완료",
-                f"원본 TIFF {total}개 중 {success}개를 처리했습니다.\n"
-                f"생성 파일: {success * len(DEFAULT_CHANNELS)}개\n\n{output}\n\n"
-                "전체 처리 내역은 extraction_report.csv에 저장되었습니다.",
-            )
-        elif terminal_event is not None and terminal_event[0] == "empty":
-            _, source_folder = terminal_event
-            self.progress.stop()
-            self.progress.configure(mode="determinate", value=0)
-            self.running = False
-            self.run_button.configure(state="normal")
-            self.status.set("TIFF 파일 없음")
-            messagebox.showinfo(
-                "TIFF 없음",
-                f"입력 폴더에서 TIFF 파일을 찾지 못했습니다.\n\n{source_folder}",
-            )
-        elif terminal_event is not None and terminal_event[0] == "fatal":
-            _, error, output_folder = terminal_event
-            self.progress.stop()
-            self.progress.configure(mode="determinate", value=0)
-            self.running = False
-            self.run_button.configure(state="normal")
-            self.status.set("작업 실패")
-            messagebox.showerror(
-                "추출 실패",
-                f"작업을 계속할 수 없는 오류가 발생했습니다.\n\n{error}\n\n출력 폴더: {output_folder}",
-            )
-
+                if event[0] == "row":
+                    _, position, total, source, count, status = event
+                    self.progress["value"] = position
+                    self.status.set(f"처리 중 {position}/{total}")
+                    self.table.insert("", "end", values=(source.name, count, status))
+                    self.table.yview_moveto(1)
+                elif event[0] == "done":
+                    _, success, total, output = event
+                    self.running = False
+                    self.run_button.configure(state="normal")
+                    self.status.set(f"완료: {total}개 중 {success}개 성공")
+                    messagebox.showinfo(
+                        "추출 완료",
+                        f"원본 TIFF {total}개 중 {success}개를 처리했습니다.\n"
+                        f"생성 예정/최대 파일: {success * len(DEFAULT_CHANNELS)}개\n\n{output}",
+                    )
+        except queue.Empty:
+            pass
         if self.running:
-            delay = (
-                BUSY_POLL_INTERVAL_MS
-                if processed_events == EVENT_BATCH_LIMIT
-                else POLL_INTERVAL_MS
-            )
-            self.root.after(delay, self._poll_responsive)
-
-    def _trim_table_rows(self):
-        """Keep the table fast while the CSV retains every result row."""
-        rows = self.table.get_children()
-        excess = len(rows) - TABLE_ROW_LIMIT
-        if excess <= 0:
-            return
-        delete_count = min(len(rows), max(excess, TABLE_TRIM_CHUNK))
-        self.table.delete(*rows[:delete_count])
-        self.hidden_table_rows += delete_count
+            self.root.after(75, self._poll)
 
 
 if __name__ == "__main__":
